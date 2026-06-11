@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volley"
+version = "0.1.0"
+description = "Volley: a Python coding-agent framework for decentralized multi-agent collaboration."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Weiwei Sun" }]
+keywords = ["volley", "agent", "multi-agent", "coding-agent", "cli", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.optional-dependencies]
+images = ["Pillow>=10"]
+
+[project.urls]
+Homepage = "https://github.com/sunnweiwei/volley"
+Repository = "https://github.com/sunnweiwei/volley"
+
+[project.scripts]
+volley = "volley.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["volley*"]
+
+[tool.setuptools.package-data]
+volley = [
+    "assets/**/*",
+]

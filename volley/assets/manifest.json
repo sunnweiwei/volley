@@ -1,0 +1,10 @@
+{
+  "upstream_commit": "392e94e9ea756cffd89f35941e881d29b2a81a6e",
+  "assets": {
+    "prompts/gpt_5_codex_prompt.md": "42842be69650ae563d212695e8d3f3591534908fd8ca33b63f742daf41f88b65",
+    "prompts/gpt_5_2_prompt.md": "c9b2fa097ac69cae82c3d2ae12271083890a96521c55ad8dc14cae5168ad3f39",
+    "prompts/gpt-5.2-codex_prompt.md": "1b3dd697043a7f613c691a3721a450251626685b3e97ac3ad3d35ea62758a31e",
+    "prompts/prompt_with_apply_patch_instructions.md": "a78d24ea274453453cedc397095b1a1bfe7218fe884f4e75c6e828375dd42241",
+    "grammars/apply_patch.lark": "d6367f4826ed608c424b0a308f3d6163527df63c22513d089b91863552f8bfeb"
+  }
+}
