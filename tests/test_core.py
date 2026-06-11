@@ -12015,6 +12015,47 @@ model_reasoning_effort = "low"
             self.assertEqual(turn_context["effort"], "high")
             self.assertFalse((official_home / "sessions").exists())
 
+    def test_resume_search_reads_legacy_codex_python_sessions(self) -> None:
+        from volley import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_home = root / "codex-python-home"
+            volley_home = root / "volley-home"
+            result = VolleySession(
+                VolleyConfig(
+                    cwd=root,
+                    volley_home=legacy_home,
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                ),
+                model_client=ScriptedResponsesModel([message("legacy answer")]),
+            ).run("legacy prompt")
+            rollout_path = next((legacy_home / "sessions").glob(f"????/??/??/rollout-*-{result.thread_id}.jsonl"))
+            config = VolleyConfig(
+                cwd=root,
+                volley_home=volley_home,
+                skip_git_repo_check=True,
+                ephemeral=False,
+            )
+            args = type(
+                "Args",
+                (),
+                {"last": False, "session_id": result.thread_id, "all_cwds": False},
+            )()
+
+            with unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_PY_HOME": str(legacy_home),
+                    "CODEX_HOME": str(root / "missing-codex-home"),
+                },
+            ):
+                self.assertEqual(cli._resolve_resume_rollout(args, config), rollout_path)
+                picker_paths = [row.path for row in cli._rollout_picker_rows(config)]
+
+        self.assertIn(rollout_path, picker_paths)
+
     def test_cli_exec_oss_flags_and_provider_config_with_fake_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
