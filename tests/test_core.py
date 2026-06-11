@@ -220,6 +220,7 @@ _codex_safe_from("volley.prompts", "build_permissions_instructions", "collect_ag
 _codex_safe_from("volley.prompts", "verify_asset_hashes", "read_model_catalog_instructions")
 _codex_safe_from("volley.prompts", "ASSETS_DIR as _CODEX_ASSETS_DIR")
 _codex_safe_from("volley.cli", "_model_provider_for_model")
+_codex_safe_from("volley.cli", "_resolve_live_session_for_resume")
 _codex_safe_from("volley.cli", "_set_session_model")
 
 
@@ -321,6 +322,7 @@ _codex_safe_from("volley.state", "VOLLEY_ROLLOUT_ITEM_TYPES")
 _codex_safe_import("volley.tools", "codex_tools")
 _codex_safe_from("volley.tools", "ToolRuntime")
 _codex_safe_from("volley.tools", "ToolResult")
+_codex_safe_from("volley.session_daemon", "PersistentSessionClient", "resolve_live_session", "start_persistent_session_worker")
 _codex_safe_from("volley.types", "KNOWN_EVENT_TYPES")
 _codex_safe_from("volley.types", "PromptRequest")
 _codex_safe_from("volley.types", "TERMINAL_TURN_EVENT_TYPES")
@@ -442,6 +444,26 @@ def _plain_terminal_output(text: str) -> str:
 
 
 class CoreCoreTests(unittest.TestCase):
+    def _wait_for_pid_exit(self, pid: int, timeout: float = 2.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            return
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+
     def test_prompt_assets_match_manifest(self) -> None:
         self.assertTrue(all(verify_asset_hashes().values()))
 
@@ -12871,6 +12893,622 @@ model_reasoning_effort = "low"
             self.assertEqual(target.read_text(encoding="utf-8"), original,
                              "apply_patch must leave the file untouched when "
                              "the patch is rejected")
+
+    def test_persistent_session_worker_continues_after_client_disconnect(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("persistent session workers require Unix domain sockets")
+        if not PersistentSessionClient or not start_persistent_session_worker or not _resolve_live_session_for_resume:
+            self.skipTest("persistent session worker support is unavailable")
+
+        old_fake = os.environ.get("PY_VOLLEY_FAKE_RESPONSES")
+        os.environ["PY_VOLLEY_FAKE_RESPONSES"] = json.dumps([
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "sleep-1",
+                        "arguments": json.dumps({"cmd": "sleep 0.6; echo done"}),
+                    }
+                ]
+            },
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "finished after detach"}],
+                    }
+                ]
+            },
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            session = VolleySession(
+                VolleyConfig(
+                    volley_home=Path(tmp),
+                    cwd=Path.cwd(),
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                    model_stream_max_retries=0,
+                ),
+            )
+            try:
+                info = start_persistent_session_worker(session)
+                self.assertIsNone(resolve_live_session(Path(tmp), info.thread_id))
+                first = PersistentSessionClient(info.socket_path)
+                first.connect()
+                first.send({"type": "submit", "text": "keep running"})
+                first.close()
+
+                live_args = type("Args", (), {"session_id": info.thread_id, "last": False, "all_cwds": False})()
+                live_deadline = time.time() + 2
+                live = None
+                while time.time() < live_deadline:
+                    live = _resolve_live_session_for_resume(live_args, session.config)
+                    if live is not None:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(live)
+                self.assertEqual(live.thread_id, info.thread_id)
+                second = PersistentSessionClient(info.socket_path)
+                second.connect()
+                saw_status = False
+                saw_user = False
+                saw_text = False
+                saw_done = False
+                deadline = time.time() + 3
+                while time.time() < deadline and not saw_done:
+                    try:
+                        msg = second.messages.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if msg.get("type") in {"hello", "state"}:
+                        status = msg.get("status")
+                        if isinstance(status, dict) and "context_window" in status:
+                            saw_status = True
+                    if msg.get("type") != "event":
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.user_message" and event.get("text") == "keep running":
+                        saw_user = True
+                    if event.get("type") == "item.completed" and "finished after detach" in json.dumps(event):
+                        saw_text = True
+                    if event.get("type") == "turn.completed":
+                        saw_done = True
+                idle_deadline = time.time() + 2
+                while time.time() < idle_deadline and resolve_live_session(Path(tmp), info.thread_id) is not None:
+                    time.sleep(0.05)
+                try:
+                    second.send({"type": "shutdown"})
+                finally:
+                    second.close()
+                self._wait_for_pid_exit(info.pid)
+                self.assertIsNone(resolve_live_session(Path(tmp), info.thread_id))
+                self.assertTrue(saw_status)
+                self.assertTrue(saw_user)
+                self.assertTrue(saw_text)
+                self.assertTrue(saw_done)
+            finally:
+                if old_fake is None:
+                    os.environ.pop("PY_VOLLEY_FAKE_RESPONSES", None)
+                else:
+                    os.environ["PY_VOLLEY_FAKE_RESPONSES"] = old_fake
+
+    def test_persistent_session_multiple_clients_can_control_same_running_job(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("persistent session workers require Unix domain sockets")
+        if not PersistentSessionClient or not start_persistent_session_worker:
+            self.skipTest("persistent session worker support is unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = VolleySession(
+                VolleyConfig(
+                    volley_home=Path(tmp),
+                    cwd=Path.cwd(),
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                    model_stream_max_retries=0,
+                ),
+            )
+            info = start_persistent_session_worker(session)
+            first = PersistentSessionClient(info.socket_path)
+            second = PersistentSessionClient(info.socket_path)
+            try:
+                first.connect()
+                second.connect()
+                deadline = time.time() + 2
+                while time.time() < deadline and (not first.thread_id or not second.thread_id):
+                    time.sleep(0.05)
+                self.assertTrue(first.control)
+                self.assertTrue(second.control)
+
+                second.send({"type": "slash", "text": "/status"})
+                saw_status = False
+                deadline = time.time() + 2
+                while time.time() < deadline and not saw_status:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.notice" and " is idle." in str(event.get("message") or ""):
+                        saw_status = True
+                self.assertTrue(saw_status)
+
+                first.send({"type": "slash", "text": "/rollout"})
+                saw_rollout = False
+                deadline = time.time() + 2
+                while time.time() < deadline and not saw_rollout:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.notice" and "Current rollout path:" in str(event.get("message") or ""):
+                        saw_rollout = True
+                self.assertTrue(saw_rollout)
+            finally:
+                try:
+                    second.send({"type": "shutdown"})
+                except Exception:
+                    pass
+                first.close()
+                second.close()
+                self._wait_for_pid_exit(info.pid)
+
+    def test_persistent_session_never_marks_second_attach_read_only(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("persistent session workers require Unix domain sockets")
+        if not PersistentSessionClient or not start_persistent_session_worker:
+            self.skipTest("persistent session worker support is unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = VolleySession(
+                VolleyConfig(
+                    volley_home=Path(tmp),
+                    cwd=Path.cwd(),
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                    model_stream_max_retries=0,
+                ),
+            )
+            info = start_persistent_session_worker(session)
+            first = PersistentSessionClient(info.socket_path)
+            second = PersistentSessionClient(info.socket_path)
+            try:
+                first.connect()
+                second.connect()
+                deadline = time.time() + 2
+                while time.time() < deadline and (not first.thread_id or not second.thread_id):
+                    time.sleep(0.05)
+                self.assertTrue(first.control)
+                self.assertTrue(second.control)
+
+                while True:
+                    try:
+                        first.messages.get_nowait()
+                    except queue.Empty:
+                        break
+                while True:
+                    try:
+                        second.messages.get_nowait()
+                    except queue.Empty:
+                        break
+
+                second.send({"type": "slash", "text": "/status"})
+                saw_status = False
+                deadline = time.time() + 2
+                while time.time() < deadline and not saw_status:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    message = str(event.get("message") or "")
+                    self.assertNotIn("read-only", message)
+                    if event.get("type") == "daemon.notice" and " is idle." in message:
+                        saw_status = True
+                self.assertTrue(saw_status)
+
+                first_messages: list[dict[str, Any]] = []
+                deadline = time.time() + 0.3
+                while time.time() < deadline:
+                    try:
+                        first_messages.append(first.messages.get(timeout=0.05))
+                    except queue.Empty:
+                        pass
+                self.assertFalse(
+                    any(
+                        (msg.get("event") or {}).get("type") == "daemon.notice"
+                        and "read-only" in str((msg.get("event") or {}).get("message") or "")
+                        for msg in first_messages
+                    )
+                )
+                self.assertTrue(first.control)
+                self.assertTrue(second.control)
+            finally:
+                try:
+                    first.send({"type": "shutdown"})
+                except Exception:
+                    pass
+                first.close()
+                second.close()
+                self._wait_for_pid_exit(info.pid)
+
+    def test_persistent_session_request_user_input_accepts_answer_from_any_client(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("persistent session workers require Unix domain sockets")
+        if not PersistentSessionClient or not start_persistent_session_worker:
+            self.skipTest("persistent session worker support is unavailable")
+
+        questions = [
+            {
+                "id": "choice",
+                "header": "Choice",
+                "question": "Pick one.",
+                "options": [{"label": "A (Recommended)", "description": "Choose A."}],
+            }
+        ]
+        old_fake = os.environ.get("PY_VOLLEY_FAKE_RESPONSES")
+        os.environ["PY_VOLLEY_FAKE_RESPONSES"] = json.dumps([
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "request_user_input",
+                        "call_id": "input-1",
+                        "arguments": json.dumps({"questions": questions}),
+                    }
+                ]
+            },
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "answered after transfer"}],
+                    }
+                ]
+            },
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            session = VolleySession(
+                VolleyConfig(
+                    volley_home=Path(tmp),
+                    cwd=Path.cwd(),
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                    collaboration_mode="Plan",
+                    model_stream_max_retries=0,
+                ),
+            )
+            first: Any = None
+            second: Any = None
+            info: Any = None
+            try:
+                info = start_persistent_session_worker(session)
+                first = PersistentSessionClient(info.socket_path)
+                second = PersistentSessionClient(info.socket_path)
+                first.connect()
+                second.connect()
+                deadline = time.time() + 2
+                while time.time() < deadline and (not first.thread_id or not second.thread_id):
+                    time.sleep(0.05)
+                self.assertTrue(first.control)
+                self.assertTrue(second.control)
+
+                while True:
+                    try:
+                        second.messages.get_nowait()
+                    except queue.Empty:
+                        break
+                first.send({"type": "submit", "text": "ask"})
+
+                request_id = ""
+                deadline = time.time() + 3
+                while time.time() < deadline and not request_id:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.request_user_input":
+                        request_id = str(event.get("request_id") or "")
+                self.assertTrue(second.control)
+                self.assertTrue(request_id)
+
+                second.send(
+                    {
+                        "type": "request_user_input_response",
+                        "request_id": request_id,
+                        "answer": {"answers": {"choice": {"answers": ["A"]}}},
+                    }
+                )
+                saw_final = False
+                deadline = time.time() + 3
+                while time.time() < deadline and not saw_final:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "item.completed" and "answered after transfer" in json.dumps(event):
+                        saw_final = True
+                self.assertTrue(saw_final)
+            finally:
+                try:
+                    if second is not None:
+                        second.send({"type": "shutdown"})
+                except Exception:
+                    pass
+                if first is not None:
+                    first.close()
+                if second is not None:
+                    second.close()
+                if info is not None:
+                    self._wait_for_pid_exit(info.pid)
+                if old_fake is None:
+                    os.environ.pop("PY_VOLLEY_FAKE_RESPONSES", None)
+                else:
+                    os.environ["PY_VOLLEY_FAKE_RESPONSES"] = old_fake
+
+    def test_persistent_session_interrupt_after_reattach_makes_next_submit_new_turn(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("persistent session workers require Unix domain sockets")
+        if not PersistentSessionClient or not start_persistent_session_worker:
+            self.skipTest("persistent session worker support is unavailable")
+
+        old_fake = os.environ.get("PY_VOLLEY_FAKE_RESPONSES")
+        os.environ["PY_VOLLEY_FAKE_RESPONSES"] = json.dumps([
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "sleep-1",
+                        "arguments": json.dumps({"cmd": "sleep 30; echo old"}),
+                    }
+                ]
+            },
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "follow-up final"}],
+                    }
+                ]
+            },
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            session = VolleySession(
+                VolleyConfig(
+                    volley_home=Path(tmp),
+                    cwd=Path.cwd(),
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                    model_stream_max_retries=0,
+                ),
+            )
+            first: Any = None
+            second: Any = None
+            info: Any = None
+            try:
+                info = start_persistent_session_worker(session)
+                first = PersistentSessionClient(info.socket_path)
+                first.connect()
+                first.send({"type": "submit", "text": "start long task"})
+
+                saw_long_user = False
+                deadline = time.time() + 3
+                while time.time() < deadline and not saw_long_user:
+                    try:
+                        msg = first.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.user_message" and event.get("text") == "start long task":
+                        saw_long_user = True
+                self.assertTrue(saw_long_user)
+                first.close()
+
+                second = PersistentSessionClient(info.socket_path)
+                second.connect()
+                saw_replayed_user = False
+                saw_tool_started = False
+                deadline = time.time() + 5
+                while time.time() < deadline and not saw_tool_started:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.user_message" and event.get("text") == "start long task":
+                        saw_replayed_user = True
+                    if event.get("type") == "tool.started" and event.get("name") == "exec_command":
+                        saw_tool_started = True
+                self.assertTrue(saw_replayed_user)
+                self.assertTrue(saw_tool_started)
+
+                second.send({"type": "interrupt"})
+                second.send({"type": "submit", "text": "follow up after interrupt"})
+
+                saw_aborted = False
+                saw_follow_user = False
+                saw_pending_false = False
+                saw_final = False
+                seen_events: list[tuple[str | None, str | None, bool | None]] = []
+                deadline = time.time() + 10
+                while time.time() < deadline and not (
+                    saw_aborted and saw_pending_false and saw_follow_user and saw_final
+                ):
+                    try:
+                        msg = second.messages.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    seen_events.append((event.get("type"), event.get("text"), event.get("active")))
+                    if event.get("type") == "turn.aborted":
+                        saw_aborted = True
+                    if event.get("type") == "daemon.pending_input" and event.get("text") == "follow up after interrupt":
+                        saw_pending_false = saw_pending_false or not bool(event.get("active"))
+                    if event.get("type") == "daemon.user_message" and event.get("text") == "follow up after interrupt":
+                        saw_follow_user = True
+                    if event.get("type") == "item.completed" and "follow-up final" in json.dumps(event):
+                        saw_final = True
+                flags = {
+                    "aborted": saw_aborted,
+                    "pending_false": saw_pending_false,
+                    "follow_user": saw_follow_user,
+                    "final": saw_final,
+                    "events": seen_events[-20:],
+                }
+                self.assertTrue(saw_aborted, flags)
+                self.assertTrue(saw_pending_false, flags)
+                self.assertTrue(saw_follow_user, flags)
+                self.assertTrue(saw_final, flags)
+            finally:
+                try:
+                    if second is not None:
+                        second.send({"type": "shutdown"})
+                except Exception:
+                    pass
+                if first is not None:
+                    first.close()
+                if second is not None:
+                    second.close()
+                if info is not None:
+                    self._wait_for_pid_exit(info.pid)
+                if old_fake is None:
+                    os.environ.pop("PY_VOLLEY_FAKE_RESPONSES", None)
+                else:
+                    os.environ["PY_VOLLEY_FAKE_RESPONSES"] = old_fake
+
+    def test_persistent_session_interrupt_after_reattach_returns_chat_to_idle(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("persistent session workers require Unix domain sockets")
+        if not PersistentSessionClient or not start_persistent_session_worker:
+            self.skipTest("persistent session worker support is unavailable")
+
+        old_fake = os.environ.get("PY_VOLLEY_FAKE_RESPONSES")
+        os.environ["PY_VOLLEY_FAKE_RESPONSES"] = json.dumps([
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "sleep-1",
+                        "arguments": json.dumps({"cmd": "sleep 30; echo old"}),
+                    }
+                ]
+            },
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "new turn final"}],
+                    }
+                ]
+            },
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            session = VolleySession(
+                VolleyConfig(
+                    volley_home=Path(tmp),
+                    cwd=Path.cwd(),
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                    model_stream_max_retries=0,
+                ),
+            )
+            first: Any = None
+            second: Any = None
+            info: Any = None
+            try:
+                info = start_persistent_session_worker(session)
+                first = PersistentSessionClient(info.socket_path)
+                first.connect()
+                first.send({"type": "submit", "text": "start long task"})
+
+                saw_long_user = False
+                deadline = time.time() + 3
+                while time.time() < deadline and not saw_long_user:
+                    try:
+                        msg = first.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.user_message" and event.get("text") == "start long task":
+                        saw_long_user = True
+                self.assertTrue(saw_long_user)
+                first.close()
+
+                second = PersistentSessionClient(info.socket_path)
+                second.connect()
+                saw_tool_started = False
+                deadline = time.time() + 5
+                while time.time() < deadline and not saw_tool_started:
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "tool.started" and event.get("name") == "exec_command":
+                        saw_tool_started = True
+                self.assertTrue(saw_tool_started)
+
+                second.send({"type": "interrupt"})
+                saw_aborted = False
+                saw_idle_state = False
+                deadline = time.time() + 3
+                while time.time() < deadline and not (saw_aborted and saw_idle_state):
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "turn.aborted":
+                        saw_aborted = True
+                    if msg.get("type") == "state" and not bool(msg.get("running")):
+                        saw_idle_state = True
+                self.assertTrue(saw_aborted)
+                self.assertTrue(saw_idle_state)
+                self.assertFalse(second.running)
+                self.assertIsNone(resolve_live_session(Path(tmp), info.thread_id))
+
+                second.send({"type": "submit", "text": "new turn after abort"})
+                saw_follow_user = False
+                saw_final = False
+                deadline = time.time() + 5
+                while time.time() < deadline and not (saw_follow_user and saw_final):
+                    try:
+                        msg = second.messages.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    event = msg.get("event") or {}
+                    if event.get("type") == "daemon.user_message" and event.get("text") == "new turn after abort":
+                        saw_follow_user = True
+                    if event.get("type") == "item.completed" and "new turn final" in json.dumps(event):
+                        saw_final = True
+                self.assertTrue(saw_follow_user)
+                self.assertTrue(saw_final)
+            finally:
+                try:
+                    if second is not None:
+                        second.send({"type": "shutdown"})
+                except Exception:
+                    pass
+                if first is not None:
+                    first.close()
+                if second is not None:
+                    second.close()
+                if info is not None:
+                    self._wait_for_pid_exit(info.pid)
+                if old_fake is None:
+                    os.environ.pop("PY_VOLLEY_FAKE_RESPONSES", None)
+                else:
+                    os.environ["PY_VOLLEY_FAKE_RESPONSES"] = old_fake
 
 
 if __name__ == "__main__":

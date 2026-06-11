@@ -106,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if raw_argv and raw_argv[0] == "__persistent-worker":
+        return _main_persistent_worker(raw_argv[1:])
     if len(raw_argv) >= 2 and raw_argv[0] == "exec" and raw_argv[1] == "resume":
         return _main_exec_resume(raw_argv[2:])
     if len(raw_argv) >= 2 and raw_argv[0] == "exec" and raw_argv[1] == "fork":
@@ -114,6 +116,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _main_resume_chat(raw_argv[1:], fork=False)
     if raw_argv and raw_argv[0] == "fork":
         return _main_resume_chat(raw_argv[1:], fork=True)
+    if raw_argv and raw_argv[0] == "attach":
+        return _main_attach(raw_argv[1:])
     if raw_argv and raw_argv[0] == "chat":
         return _main_chat(raw_argv[1:], prog=_volley_module_prog("chat"))
     if _should_route_to_chat(raw_argv):
@@ -134,6 +138,9 @@ def _main(argv: list[str] | None = None) -> int:
     fork_parser.add_argument("--last", action="store_true")
     fork_parser.add_argument("--all", action="store_true", dest="all_cwds")
     _add_exec_options(fork_parser)
+    attach_parser = subparsers.add_parser("attach", help="attach to a live persistent session")
+    attach_parser.add_argument("session_id", nargs="?")
+    attach_parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     login_parser = subparsers.add_parser("login", help="sign in to ChatGPT for Volley")
     login_parser.add_argument("login_command", nargs="?", choices=["status"])
     login_parser.add_argument("--json", action="store_true", dest="login_json")
@@ -155,6 +162,9 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "login":
         return _main_login(args)
 
+    if args.command == "attach":
+        return _main_attach(raw_argv[1:])
+
     if args.command != "exec":
         parser.print_help(sys.stderr)
         return 2
@@ -175,7 +185,7 @@ def _main(argv: list[str] | None = None) -> int:
 def _should_route_to_chat(raw_argv: list[str]) -> bool:
     if not raw_argv:
         return True
-    if raw_argv[0] in {"-h", "--help", "exec", "resume", "fork", "login"}:
+    if raw_argv[0] in {"-h", "--help", "exec", "resume", "fork", "attach", "login"}:
         return False
     return True
 
@@ -256,6 +266,50 @@ def _main_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def _main_attach(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=_volley_module_prog("attach"))
+    parser.add_argument("session_id", nargs="?")
+    parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    args = parser.parse_args(argv)
+    try:
+        from .session_daemon import resolve_live_session
+
+        info = resolve_live_session(_default_volley_home(), args.session_id)
+    except Exception as exc:
+        _print_cli_error(exc)
+        return 1
+    if info is None:
+        selector = args.session_id or "latest"
+        print(f"No live persistent Volley session found for `{selector}`.", file=sys.stderr)
+        return 1
+    return _run_persistent_attach(info.socket_path, color_mode=args.color)
+
+
+def _main_persistent_worker(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=_volley_module_prog("__persistent-worker"))
+    parser.add_argument("payload_path")
+    args = parser.parse_args(argv)
+    from .session_daemon import run_persistent_session_worker
+
+    return run_persistent_session_worker(args.payload_path)
+
+
+def _resolve_live_session_for_resume(args: argparse.Namespace, config: VolleyConfig) -> Any | None:
+    try:
+        from .session_daemon import list_live_sessions, resolve_live_session
+    except Exception:
+        return None
+    if getattr(args, "session_id", None):
+        return resolve_live_session(config.resolved_volley_home(), str(args.session_id))
+    if not getattr(args, "last", False) and getattr(args, "session_id", None):
+        return None
+    sessions = list_live_sessions(config.resolved_volley_home())
+    if not getattr(args, "all_cwds", False):
+        cwd = config.resolved_cwd()
+        sessions = [info for info in sessions if Path(getattr(info, "cwd", "")).expanduser().resolve() == cwd]
+    return sessions[0] if sessions else None
+
+
 def _main_exec_resume(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=_volley_module_prog("exec", "resume"))
     parser.add_argument("session_id", nargs="?")
@@ -333,15 +387,49 @@ def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
         return 1
 
     try:
-        if args.session_id or args.last:
-            rollout_path = _resolve_resume_rollout(args, config)
+        if fork:
+            if args.session_id or args.last:
+                rollout_path = _resolve_resume_rollout(args, config)
+            else:
+                rollout_path = _prompt_rollout_picker(
+                    config,
+                    title="Fork a previous session",
+                    all_cwds=args.all_cwds,
+                    color_mode=args.color,
+                )
         else:
-            rollout_path = _prompt_rollout_picker(
-                config,
-                title="Fork a previous session" if fork else "Resume a previous session",
-                all_cwds=args.all_cwds,
-                color_mode=args.color,
+            target = (
+                _resolve_resume_target_selector(
+                    _resume_selector_rest_from_args(args),
+                    config,
+                    title="Resume a previous session",
+                    color_mode=args.color,
+                )
+                if args.session_id or args.last
+                else _prompt_resume_target(
+                    config,
+                    title="Resume a previous session",
+                    all_cwds=args.all_cwds,
+                    color_mode=args.color,
+                )
             )
+            if target is None:
+                return 1 if (args.session_id or args.last) else 0
+            if target.live_session is not None:
+                thread_id = str(getattr(target.live_session, "thread_id", "") or args.session_id or "selected chat")
+                if not getattr(args, "persistent", False):
+                    print(
+                        f"Chat {thread_id} is currently running in the background. "
+                        f"Resume it with `{_volley_module_prog('resume', thread_id, '--persistent')}`.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                return _run_persistent_attach(
+                    Path(getattr(target.live_session, "socket_path")),
+                    color_mode=args.color,
+                    base_config=config,
+                )
+            rollout_path = target.rollout_path
         if rollout_path is None:
             if args.session_id or args.last:
                 selector = args.session_id or "--last"
@@ -352,6 +440,14 @@ def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
             session = VolleySession.fork_from_rollout(rollout_path, config)
         else:
             session = VolleySession.resume_from_rollout(rollout_path, config)
+        if getattr(args, "persistent", False):
+            return _run_persistent_chat(
+                session,
+                None,
+                color_mode=args.color,
+                replay_history=rollout_path is not None,
+                history_source_path=rollout_path,
+            )
         return _run_chat(
             session,
             None,
@@ -383,6 +479,8 @@ def _main_chat(argv: list[str], *, prog: str | None = None) -> int:
     try:
         session = VolleySession(config)
         initial_prompt = _normalize_optional_prompt(args.prompt)
+        if getattr(args, "persistent", False):
+            return _run_persistent_chat(session, initial_prompt, color_mode=args.color)
         return _run_chat(session, initial_prompt, color_mode=args.color)
     except Exception as exc:
         _print_cli_error(exc)
@@ -410,6 +508,7 @@ def _add_exec_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ignore-rules", action="store_true")
     parser.add_argument("--skip-git-repo-check", action="store_true")
     parser.add_argument("--ephemeral", action="store_true")
+    parser.add_argument("--persistent", action="store_true", help="run interactive chat through a detachable local worker")
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--output-last-message", "-o")
     parser.add_argument("--output-schema")
@@ -697,6 +796,392 @@ def _run_chat(
             if continuation_status != 0:
                 exit_status = continuation_status
         prompt = None
+
+
+def _run_persistent_chat(
+    session: VolleySession,
+    initial_prompt: str | None,
+    *,
+    color_mode: str = "auto",
+    replay_history: bool = False,
+    history_source_path: Path | None = None,
+) -> int:
+    if session.config.ephemeral:
+        print("`--persistent` cannot be combined with `--ephemeral`.", file=sys.stderr)
+        return 2
+    if replay_history:
+        _render_resumed_transcript(session, source_path=history_source_path, color_mode=color_mode)
+    elif initial_prompt is None:
+        _render_chat_startup_panel(session, color_mode=color_mode)
+    try:
+        from .session_daemon import start_persistent_session_worker
+
+        info = start_persistent_session_worker(
+            session,
+            resume_rollout_path=history_source_path if replay_history else None,
+        )
+    except Exception as exc:
+        _print_cli_error(exc)
+        return 1
+    return _run_persistent_attach(
+        info.socket_path,
+        initial_prompt=initial_prompt,
+        color_mode=color_mode,
+        base_config=session.config,
+    )
+
+
+def _run_persistent_attach(
+    socket_path: Path,
+    *,
+    initial_prompt: str | None = None,
+    color_mode: str = "auto",
+    base_config: VolleyConfig | None = None,
+) -> int:
+    try:
+        from .session_daemon import PersistentSessionClient
+
+        client = PersistentSessionClient(socket_path)
+        client.connect()
+    except Exception as exc:
+        _print_cli_error(exc)
+        return 1
+
+    output: "queue.Queue[Any]" = queue.Queue()
+    status_tracker = _LiveTurnStatus()
+    renderer = _HumanEventRenderer(color_mode=color_mode, line_sink=output.put, status_tracker=status_tracker)
+    handled_request_inputs: set[str] = set()
+    status_metrics: dict[str, Any] = {}
+    last_running = False
+    replay_until_seq = 0
+    turn_outcome: str | None = None
+    initial_sent = False
+    exit_status = 0
+
+    def set_turn_outcome(value: str | None) -> None:
+        nonlocal turn_outcome
+        turn_outcome = value
+
+    def switch_to_resume_target(target: _ResumeTarget, reader: "_TurnInputReader") -> bool:
+        nonlocal client, last_running, replay_until_seq, turn_outcome, initial_sent
+        if target.live_session is not None:
+            next_socket = Path(getattr(target.live_session, "socket_path"))
+        else:
+            if base_config is None:
+                output.put("Cannot resume a saved chat from this attach; restart with `python -m volley resume --persistent`.")
+                return False
+            reader.suspend()
+            try:
+                resumed = VolleySession.resume_from_rollout(target.rollout_path, base_config)
+                _render_resumed_transcript(resumed, source_path=target.rollout_path, color_mode=color_mode)
+                from .session_daemon import start_persistent_session_worker
+
+                info = start_persistent_session_worker(
+                    resumed,
+                    resume_rollout_path=target.rollout_path,
+                )
+                next_socket = info.socket_path
+            except Exception as exc:
+                renderer.render_error(_exception_display_message(exc))
+                return False
+            finally:
+                reader.resume()
+        try:
+            if not client.running and client.control:
+                client.send({"type": "shutdown"})
+        except OSError:
+            pass
+        client.close()
+        try:
+            from .session_daemon import PersistentSessionClient
+
+            next_client = PersistentSessionClient(next_socket)
+            next_client.connect()
+        except Exception as exc:
+            renderer.render_error(_exception_display_message(exc))
+            return False
+        client = next_client
+        handled_request_inputs.clear()
+        status_metrics.clear()
+        last_running = False
+        replay_until_seq = 0
+        turn_outcome = None
+        initial_sent = True
+        reader.render()
+        return True
+
+    def handle_persistent_resume_command(text: str, reader: "_TurnInputReader") -> bool:
+        if not _is_persistent_resume_command(text):
+            return False
+        if client.running:
+            output.put("Wait for the current turn to finish, or detach and resume another running chat from a new terminal.")
+            return True
+        config = base_config
+        if config is None:
+            output.put("Cannot open the resume picker from this attach; use `python -m volley resume --persistent`.")
+            return True
+        reader.suspend()
+        try:
+            target = _resolve_resume_target_selector(
+                _persistent_resume_command_rest(text),
+                config,
+                title="Resume a previous session",
+                color_mode=color_mode,
+            )
+        finally:
+            reader.resume()
+        if target is None:
+            reader.render()
+            return True
+        switch_to_resume_target(target, reader)
+        return True
+
+    def drain_messages(reader: "_TurnInputReader | None") -> None:
+        nonlocal initial_sent, exit_status, last_running, replay_until_seq, turn_outcome
+        while True:
+            try:
+                message = client.messages.get_nowait()
+            except queue.Empty:
+                break
+            was_running = last_running
+            if message.get("type") == "hello":
+                replay_until_seq = _optional_int(message.get("replay_until_seq")) or 0
+            _handle_persistent_client_message(
+                client,
+                message,
+                renderer=renderer,
+                output=output,
+                input_reader=reader,
+                handled_request_inputs=handled_request_inputs,
+                status_metrics=status_metrics,
+                set_turn_outcome=set_turn_outcome,
+                color_mode=color_mode,
+            )
+            if message.get("type") in {"hello", "state"}:
+                last_running = bool(message.get("running"))
+                seq = _optional_int(message.get("seq"))
+                is_live_state = seq is None or seq > replay_until_seq
+                if is_live_state and was_running and not last_running:
+                    outcome = turn_outcome or "completed"
+                    _enqueue_finished_persistent_turn_status(
+                        status_tracker,
+                        status_metrics,
+                        output=output,
+                        color_mode=color_mode,
+                        outcome=outcome,
+                    )
+                    turn_outcome = None
+            if message.get("type") == "hello" and initial_prompt is not None and not initial_sent:
+                initial_sent = True
+                _persistent_submit_text(client, initial_prompt, renderer=renderer, output=output)
+        _drain_output_queue(output, input_reader=reader)
+        if reader is not None:
+            reader.set_status(status_tracker.snapshot_from_metrics(status_metrics) if client.running else None)
+        if client.closed.is_set():
+            exit_status = 1
+
+    try:
+        with _TurnInputReader(
+            enabled=sys.stdin.isatty() and sys.stderr.isatty(),
+            color_mode=color_mode,
+        ) as reader:
+            reader.render()
+            while not client.closed.is_set():
+                drain_messages(reader)
+                if not reader.output_partial_line_open and output.empty():
+                    reader.set_status(status_tracker.snapshot_from_metrics(status_metrics) if client.running else None)
+                for action in reader.poll():
+                    if action.kind == "interrupt":
+                        try:
+                            client.send({"type": "interrupt"})
+                        except OSError:
+                            client.close()
+                        renderer.render_interrupted()
+                    elif action.kind == "submit" and action.text.strip():
+                        if handle_persistent_resume_command(action.text, reader):
+                            _drain_output_queue(output, input_reader=reader)
+                            continue
+                        outcome = _persistent_submit_text(client, action.text, renderer=renderer, output=output)
+                        if outcome == "detach":
+                            drain_messages(reader)
+                            client.close()
+                            return 0
+                        if outcome == "shutdown":
+                            drain_messages(reader)
+                            client.close()
+                            return 0
+                _drain_output_queue(output, input_reader=reader)
+                time.sleep(0.03)
+    except KeyboardInterrupt:
+        try:
+            client.send({"type": "interrupt"})
+        except OSError:
+            pass
+        exit_status = 130
+    finally:
+        client.close()
+    return exit_status
+
+
+def _handle_persistent_client_message(
+    client: Any,
+    message: dict[str, Any],
+    *,
+    renderer: "_HumanEventRenderer",
+    output: "queue.Queue[Any]",
+    input_reader: "_TurnInputReader | None",
+    handled_request_inputs: set[str],
+    status_metrics: dict[str, Any],
+    set_turn_outcome: Callable[[str | None], None],
+    color_mode: str,
+) -> None:
+    kind = message.get("type")
+    if kind == "hello":
+        status = message.get("status")
+        if isinstance(status, dict):
+            status_metrics.clear()
+            status_metrics.update(status)
+        return
+    if kind == "state":
+        status = message.get("status")
+        if isinstance(status, dict):
+            status_metrics.clear()
+            status_metrics.update(status)
+        return
+    if kind != "event":
+        return
+    event = message.get("event")
+    if not isinstance(event, dict):
+        return
+    event_type = str(event.get("type") or "")
+    if event_type == "turn.started":
+        set_turn_outcome(None)
+    elif event_type == "turn.completed":
+        set_turn_outcome("completed")
+    elif event_type == "turn.aborted":
+        set_turn_outcome("interrupted")
+    elif event_type in {"turn.failed", "daemon.error"}:
+        set_turn_outcome("failed")
+    if event_type.startswith("daemon."):
+        _handle_persistent_daemon_event(
+            client,
+            event_type,
+            event,
+            renderer=renderer,
+            output=output,
+            input_reader=input_reader,
+            handled_request_inputs=handled_request_inputs,
+            color_mode=color_mode,
+        )
+        return
+    payload = {key: value for key, value in event.items() if key != "type"}
+    renderer.render(VolleyEvent(event_type, payload))
+    if event_type == "turn.failed":
+        renderer.render_error(str(payload.get("error") or "turn failed"))
+
+
+def _handle_persistent_daemon_event(
+    client: Any,
+    event_type: str,
+    event: dict[str, Any],
+    *,
+    renderer: "_HumanEventRenderer",
+    output: "queue.Queue[Any]",
+    input_reader: "_TurnInputReader | None",
+    handled_request_inputs: set[str],
+    color_mode: str,
+) -> None:
+    if event_type == "daemon.notice":
+        message = str(event.get("message") or "")
+        if message:
+            output.put(message)
+        return
+    if event_type == "daemon.error":
+        renderer.render_error(str(event.get("message") or "persistent session error"))
+        return
+    if event_type == "daemon.pending_input":
+        renderer.render_pending_input_preview(str(event.get("text") or ""), active=bool(event.get("active")))
+        return
+    if event_type == "daemon.user_message":
+        renderer.render_user_message(str(event.get("text") or ""))
+        return
+    if event_type == "daemon.shutdown":
+        output.put(str(event.get("message") or "Persistent session worker stopped."))
+        client.close()
+        return
+    if event_type == "daemon.request_user_input":
+        request_id = str(event.get("request_id") or "")
+        if not request_id or request_id in handled_request_inputs or not client.control:
+            return
+        questions = event.get("questions")
+        if not isinstance(questions, list):
+            return
+        handled_request_inputs.add(request_id)
+        _drain_output_queue(output, input_reader=input_reader)
+        if input_reader is not None:
+            input_reader.suspend()
+        try:
+            answer = _prompt_request_user_input(questions, color_mode=color_mode)
+        finally:
+            if input_reader is not None:
+                input_reader.resume()
+        try:
+            client.send({"type": "request_user_input_response", "request_id": request_id, "answer": answer})
+        except OSError:
+            client.close()
+
+
+def _is_persistent_resume_command(text: str) -> bool:
+    parsed = _parse_slash_name(text.lstrip())
+    if parsed is None:
+        return False
+    name, _rest = parsed
+    return name.lower() == "resume"
+
+
+def _persistent_resume_command_rest(text: str) -> str:
+    parsed = _parse_slash_name(text.lstrip())
+    if parsed is None:
+        return ""
+    return parsed[1]
+
+
+def _persistent_submit_text(
+    client: Any,
+    text: str,
+    *,
+    renderer: "_HumanEventRenderer",
+    output: "queue.Queue[Any]",
+) -> str | None:
+    value = text.strip()
+    lowered = value.lower()
+    if not value:
+        return None
+    if lowered == "/detach":
+        output.put(f"Detached from persistent session {client.thread_id}. Reattach with `{_volley_module_prog('attach', client.thread_id)}`.")
+        try:
+            client.send({"type": "detach"})
+        except OSError:
+            pass
+        return "detach"
+    if lowered in {"/quit", "/exit"}:
+        output.put(f"Detached from persistent session {client.thread_id}. Reattach with `{_volley_module_prog('attach', client.thread_id)}`.")
+        return "detach"
+    if lowered == "/shutdown":
+        output.put(f"Stopping persistent session {client.thread_id}.")
+        try:
+            client.send({"type": "shutdown"})
+        except OSError:
+            client.close()
+        return "shutdown"
+    try:
+        if value.startswith("/"):
+            client.send({"type": "slash", "text": value})
+            return None
+        client.send({"type": "submit", "text": text})
+    except OSError:
+        client.close()
+    return None
 
 
 def _render_chat_startup_panel(session: VolleySession, *, color_mode: str = "auto") -> None:
@@ -1954,7 +2439,11 @@ class _LiveTurnStatus:
         payload = getattr(event, "payload", {})
         payload = payload if isinstance(payload, dict) else {}
         with self._lock:
-            if event_type == "context_compaction.started":
+            if event_type == "turn.started":
+                self._started_at = time.monotonic()
+                self._header = "Compacting" if payload.get("compact") else "Working"
+                self._details = None
+            elif event_type == "context_compaction.started":
                 self._header = "Compacting"
                 self._details = None
             elif event_type == "context_compaction.completed":
@@ -2032,6 +2521,53 @@ class _LiveTurnStatus:
             details=details,
             animation_millis=animation_millis,
         )
+
+    def snapshot_from_metrics(
+        self,
+        metrics: dict[str, Any] | None,
+        *,
+        finished: bool = False,
+        outcome: str | None = None,
+    ) -> _LiveTurnStatusSnapshot:
+        metrics = metrics if isinstance(metrics, dict) else {}
+        with self._lock:
+            header = self._header
+            details = self._details
+            elapsed_raw = max(0.0, time.monotonic() - self._started_at)
+            elapsed = int(elapsed_raw)
+            animation_millis = int(elapsed_raw * 1000)
+        return _LiveTurnStatusSnapshot(
+            header=header,
+            elapsed_seconds=elapsed,
+            auth_label=_optional_str(metrics.get("auth_label")),
+            fast_status=_optional_str(metrics.get("fast_status")),
+            goal_status=_optional_str(metrics.get("goal_status")),
+            active_context_tokens=_optional_int(metrics.get("active_context_tokens")),
+            active_context_estimated=bool(metrics.get("active_context_estimated", True)),
+            session_context_tokens=_optional_int(metrics.get("session_context_tokens")),
+            session_context_estimated=bool(metrics.get("session_context_estimated", True)),
+            session_reasoning_tokens=_optional_int(metrics.get("session_reasoning_tokens")),
+            context_window=_optional_int(metrics.get("context_window")),
+            finished=finished,
+            outcome=outcome,
+            details=details,
+            animation_millis=animation_millis,
+        )
+
+
+def _optional_str(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class _TurnInputReader:
@@ -2928,6 +3464,26 @@ def _print_finished_turn_status(
         print("\n".join(lines), file=sys.stderr, flush=True)
 
 
+def _enqueue_finished_persistent_turn_status(
+    status_tracker: _LiveTurnStatus,
+    metrics: dict[str, Any],
+    *,
+    output: "queue.Queue[Any]",
+    color_mode: str,
+    outcome: str,
+) -> None:
+    if not sys.stderr.isatty():
+        return
+    style = _AnsiStyle(_should_use_color(color_mode))
+    lines = _live_status_display_lines(
+        status_tracker.snapshot_from_metrics(metrics, finished=True, outcome=outcome),
+        style,
+    )
+    if lines:
+        output.put("")
+        output.put("\n".join(lines))
+
+
 def _finished_status_label(snapshot: _LiveTurnStatusSnapshot) -> str:
     outcome = (snapshot.outcome or "completed").lower()
     if outcome == "interrupted":
@@ -3513,6 +4069,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandDef, ...] = (
     _SlashCommandDef("rollout", "print the rollout file path"),
     _SlashCommandDef("ps", "list background terminals"),
     _SlashCommandDef("stop", "stop all background terminals", aliases=("clean",)),
+    _SlashCommandDef("detach", "detach from a persistent session and leave it running"),
     _SlashCommandDef("clear", "clear the terminal and start a new chat", available_during_task=False),
     _SlashCommandDef("personality", "choose a communication style for Volley", available_during_task=False),
     _SlashCommandDef("realtime", "toggle realtime voice mode (experimental)"),
@@ -3545,6 +4102,7 @@ _SLASH_IMPLEMENTED_NAMES = {
     "rollout",
     "ps",
     "stop",
+    "detach",
     "clear",
 }
 _SLASH_AVAILABLE_COMMAND_BY_NAME: dict[str, _SlashCommandDef] = {
@@ -3850,6 +4408,9 @@ def _handle_interactive_slash_command(
     command = slash.command.name
     if command in {"exit", "quit"}:
         return _InteractiveSlashResult(True, exit=True, status=0)
+    if command == "detach":
+        print("Persistent detach is available when starting chat with `--persistent`.", file=sys.stderr, flush=True)
+        return _InteractiveSlashResult(True)
     if command == "clear":
         _clear_terminal()
         return _InteractiveSlashResult(True, session=_new_chat_session(session))
@@ -4308,6 +4869,102 @@ def _resolve_interactive_rollout_selector(
     return rollout_path
 
 
+def _resolve_resume_target_selector(
+    rest: str,
+    config: VolleyConfig,
+    *,
+    title: str,
+    color_mode: str = "auto",
+) -> _ResumeTarget | None:
+    parsed = _parse_resume_selector_args(rest)
+    if parsed is None:
+        return None
+    selector, last, all_cwds = parsed
+    if selector is None and not last:
+        return _prompt_resume_target(config, title=title, all_cwds=all_cwds, color_mode=color_mode)
+    if last:
+        rows = _filter_rollout_picker_rows(
+            _rollout_picker_rows(config),
+            cwd=config.resolved_cwd(),
+            show_all=all_cwds,
+            query="",
+            sort_key="updated",
+        )
+        if rows:
+            return _resume_target_from_picker_row(rows[0])
+        print("No saved Volley chats found.", file=sys.stderr, flush=True)
+        return None
+    if selector is not None:
+        live = _resolve_running_live_for_selector(config, selector, all_cwds=all_cwds)
+        if live is not None:
+            return _ResumeTarget(Path(getattr(live, "rollout_path")), live)
+    args = argparse.Namespace(session_id=selector, last=last, all_cwds=all_cwds)
+    rollout_path = _resolve_resume_rollout(args, config)
+    if rollout_path is None:
+        missing = selector or "--last"
+        print(f"No Volley rollout found for `{missing}`", file=sys.stderr, flush=True)
+        return None
+    return _ResumeTarget(rollout_path)
+
+
+def _resume_selector_rest_from_args(args: argparse.Namespace) -> str:
+    tokens: list[str] = []
+    if getattr(args, "last", False):
+        tokens.append("--last")
+    selector = getattr(args, "session_id", None)
+    if selector:
+        tokens.append(str(selector))
+    if getattr(args, "all_cwds", False):
+        tokens.append("--all")
+    return " ".join(shlex.quote(token) for token in tokens)
+
+
+def _parse_resume_selector_args(rest: str) -> tuple[str | None, bool, bool] | None:
+    try:
+        tokens = shlex.split(rest)
+    except ValueError as exc:
+        print(f"Invalid command arguments: {exc}", file=sys.stderr, flush=True)
+        return None
+    all_cwds = False
+    last = False
+    selector: str | None = None
+    for token in tokens:
+        if token == "--all":
+            all_cwds = True
+        elif token == "--last":
+            last = True
+        elif selector is None:
+            selector = token
+        else:
+            print("Usage: /resume [--last|SESSION_ID|ROLLOUT_PATH] [--all]", file=sys.stderr, flush=True)
+            return None
+    return selector, last, all_cwds
+
+
+def _resolve_running_live_for_selector(config: VolleyConfig, selector: str, *, all_cwds: bool) -> Any | None:
+    try:
+        from .session_daemon import resolve_live_session
+    except Exception:
+        return None
+    for home in _session_search_homes(config):
+        try:
+            info = resolve_live_session(home, selector)
+        except Exception:
+            continue
+        if info is None:
+            continue
+        if all_cwds or _live_session_cwd_matches(info, config.resolved_cwd()):
+            return info
+    return None
+
+
+def _live_session_cwd_matches(info: Any, cwd: Path) -> bool:
+    try:
+        return Path(getattr(info, "cwd")).expanduser().resolve() == cwd.resolve()
+    except Exception:
+        return False
+
+
 @dataclass
 class _RolloutPickerRow:
     path: Path
@@ -4317,6 +4974,13 @@ class _RolloutPickerRow:
     updated_at: float
     cwd: str | None
     git_branch: str | None = None
+    live_session: Any | None = None
+
+
+@dataclass(frozen=True)
+class _ResumeTarget:
+    rollout_path: Path
+    live_session: Any | None = None
 
 
 def _prompt_rollout_picker(
@@ -4332,13 +4996,14 @@ def _prompt_rollout_picker(
         print("No saved Volley chats found.", file=sys.stderr, flush=True)
         return None
     if sys.stdin.isatty() and sys.stderr.isatty():
-        return _interactive_rollout_picker(
+        row = _interactive_rollout_picker(
             rows,
             title=title,
             cwd=config.resolved_cwd(),
             initial_all_cwds=all_cwds,
             color_mode=color_mode,
         )
+        return row.path if row is not None else None
     choices = filtered[:10]
     print(title, file=sys.stderr)
     for index, row in enumerate(choices, start=1):
@@ -4362,8 +5027,62 @@ def _prompt_rollout_picker(
     return choices[index - 1].path
 
 
+def _prompt_resume_target(
+    config: VolleyConfig,
+    *,
+    title: str,
+    all_cwds: bool,
+    color_mode: str = "auto",
+) -> _ResumeTarget | None:
+    rows = _rollout_picker_rows(config)
+    filtered = _filter_rollout_picker_rows(rows, cwd=config.resolved_cwd(), show_all=all_cwds, query="", sort_key="updated")
+    if not filtered:
+        print("No saved Volley chats found.", file=sys.stderr, flush=True)
+        return None
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        row = _interactive_rollout_picker(
+            rows,
+            title=title,
+            cwd=config.resolved_cwd(),
+            initial_all_cwds=all_cwds,
+            color_mode=color_mode,
+        )
+        return _resume_target_from_picker_row(row) if row is not None else None
+    choices = filtered[:10]
+    print(title, file=sys.stderr)
+    for index, row in enumerate(choices, start=1):
+        marker = " [running]" if row.live_session is not None else ""
+        print(f"  {index}. {_format_rollout_picker_item(row.path)}{marker}", file=sys.stderr)
+    print("Select a chat number, or press Enter to cancel: ", end="", file=sys.stderr, flush=True)
+    if not sys.stdin.isatty():
+        print(file=sys.stderr, flush=True)
+        return None
+    raw = sys.stdin.readline().strip()
+    if not raw:
+        print("Cancelled.", file=sys.stderr, flush=True)
+        return None
+    try:
+        index = int(raw)
+    except ValueError:
+        print(f"Invalid selection `{raw}`.", file=sys.stderr, flush=True)
+        return None
+    if index < 1 or index > len(choices):
+        print(f"Invalid selection `{raw}`.", file=sys.stderr, flush=True)
+        return None
+    return _resume_target_from_picker_row(choices[index - 1])
+
+
+def _resume_target_from_picker_row(row: _RolloutPickerRow) -> _ResumeTarget:
+    return _ResumeTarget(row.path, row.live_session)
+
+
 def _rollout_picker_rows(config: VolleyConfig) -> list[_RolloutPickerRow]:
     rows: list[_RolloutPickerRow] = []
+    live_sessions = _running_live_sessions_for_picker(config)
+    live_by_thread: dict[str, Any] = {str(getattr(info, "thread_id", "")): info for info in live_sessions}
+    live_by_path: dict[str, Any] = {
+        str(Path(getattr(info, "rollout_path", "")).expanduser()): info for info in live_sessions
+    }
     for home in _session_search_homes(config):
         for path in _iter_rollout_paths(home):
             reconstruction = _safe_reconstruct_rollout(path)
@@ -4372,18 +5091,59 @@ def _rollout_picker_rows(config: VolleyConfig) -> list[_RolloutPickerRow]:
             meta = reconstruction.session_meta if isinstance(reconstruction.session_meta, dict) else {}
             raw_cwd = meta.get("cwd")
             cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
+            thread_id = _rollout_thread_id(meta) or _rollout_thread_id_from_path(path) or "unknown"
+            live = live_by_thread.pop(thread_id, None)
+            if live is None:
+                live = live_by_path.pop(str(path.expanduser()), None)
+                if live is not None:
+                    live_by_thread.pop(str(getattr(live, "thread_id", "") or ""), None)
             rows.append(
                 _RolloutPickerRow(
                     path=path,
                     preview=_rollout_preview_text(reconstruction.history),
-                    thread_id=_rollout_thread_id(meta) or _rollout_thread_id_from_path(path) or "unknown",
+                    thread_id=thread_id,
                     created_at=_rollout_created_at(meta, path),
-                    updated_at=_safe_mtime(path),
+                    updated_at=max(_safe_mtime(path), float(getattr(live, "updated_at", 0.0) or 0.0)),
                     cwd=cwd,
                     git_branch=_rollout_git_branch(path),
+                    live_session=live,
                 )
             )
+    for live in live_by_thread.values():
+        path = Path(getattr(live, "rollout_path", ""))
+        rows.append(
+            _RolloutPickerRow(
+                path=path,
+                preview="Running turn",
+                thread_id=str(getattr(live, "thread_id", "") or "unknown"),
+                created_at=float(getattr(live, "updated_at", 0.0) or _safe_mtime(path)),
+                updated_at=float(getattr(live, "updated_at", 0.0) or _safe_mtime(path)),
+                cwd=str(getattr(live, "cwd", "") or "") or None,
+                live_session=live,
+            )
+        )
     return rows
+
+
+def _running_live_sessions_for_picker(config: VolleyConfig) -> list[Any]:
+    try:
+        from .session_daemon import list_live_sessions
+    except Exception:
+        return []
+    sessions: list[Any] = []
+    seen: set[str] = set()
+    for home in _session_search_homes(config):
+        try:
+            live = list_live_sessions(home)
+        except Exception:
+            continue
+        for info in live:
+            thread_id = str(getattr(info, "thread_id", "") or "")
+            if thread_id in seen:
+                continue
+            seen.add(thread_id)
+            sessions.append(info)
+    return sessions
 
 
 def _filter_rollout_picker_rows(
@@ -4414,7 +5174,7 @@ def _interactive_rollout_picker(
     cwd: Path,
     initial_all_cwds: bool,
     color_mode: str = "auto",
-) -> Path | None:
+) -> _RolloutPickerRow | None:
     try:
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
@@ -4498,7 +5258,7 @@ def _interactive_rollout_picker(
                 filtered = current_rows()
                 if not filtered:
                     return None
-                return filtered[selected].path
+                return filtered[selected]
             if chunk in {b"\x7f", b"\b"}:
                 if query:
                     query = query[:-1]
@@ -4672,6 +5432,8 @@ def _rollout_picker_row_lines(
 
 def _rollout_picker_meta_line(row: _RolloutPickerRow, *, cwd: Path, width: int) -> str:
     parts = [_format_picker_relative_time(row.updated_at)]
+    if row.live_session is not None:
+        parts.append("running")
     if row.cwd:
         cwd_label = "." if _picker_row_cwd_matches(row, cwd) else _short_path_display(row.cwd)
         parts.append(cwd_label)
@@ -4767,7 +5529,14 @@ def _normalize_picker_preview(text: str) -> str:
 def _rollout_picker_search_text(row: _RolloutPickerRow) -> str:
     return " ".join(
         value
-        for value in [row.preview, row.thread_id, row.cwd or "", row.git_branch or "", str(row.path)]
+        for value in [
+            row.preview,
+            row.thread_id,
+            "running" if row.live_session is not None else "",
+            row.cwd or "",
+            row.git_branch or "",
+            str(row.path),
+        ]
         if value
     )
 

@@ -286,6 +286,9 @@ class VolleySession:
         )
 
     def stream_compact(self, prompt: str | None = None) -> Iterator[VolleyEvent]:
+        clear_tool_interrupt = getattr(self.tools, "clear_interrupt", None)
+        if callable(clear_tool_interrupt):
+            clear_tool_interrupt()
         yield from self._stream_compact(prompt, trigger="manual", reason="manual", phase="standalone_turn")
 
     def stream_goal_continuation(self) -> Iterator[VolleyEvent]:
@@ -557,6 +560,9 @@ class VolleySession:
 
     def stream(self, prompt: str) -> Iterator[VolleyEvent]:
         self._interrupt_event.clear()
+        clear_tool_interrupt = getattr(self.tools, "clear_interrupt", None)
+        if callable(clear_tool_interrupt):
+            clear_tool_interrupt()
         self.state.start_turn()
         self._begin_active_turn("regular")
         cwd = self.config.resolved_cwd()
@@ -940,10 +946,7 @@ class VolleySession:
                     arguments=call["arguments"],
                 )
             with ThreadPoolExecutor(max_workers=len(calls)) as executor:
-                futures = [
-                    executor.submit(self.tools.dispatch, call["name"], call["arguments"], call_id=call["call_id"])
-                    for call in calls
-                ]
+                futures = [executor.submit(self._dispatch_tool_preserving_interrupt, call) for call in calls]
                 for call, future in zip(calls, futures):
                     self._check_interrupted()
                     result = yield from self._await_tool_future(future)
@@ -1009,9 +1012,22 @@ class VolleySession:
 
     def _dispatch_tool_call_with_runtime_events(self, call: dict[str, Any]) -> Iterator[VolleyEvent | ToolResult]:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self.tools.dispatch, call["name"], call["arguments"], call_id=call["call_id"])
+            future = executor.submit(self._dispatch_tool_preserving_interrupt, call)
             result = yield from self._await_tool_future(future)
         return result
+
+    def _dispatch_tool_preserving_interrupt(self, call: dict[str, Any]) -> ToolResult:
+        try:
+            return self.tools.dispatch(
+                call["name"],
+                call["arguments"],
+                call_id=call["call_id"],
+                clear_interrupt=False,
+            )
+        except TypeError as exc:
+            if "clear_interrupt" not in str(exc):
+                raise
+            return self.tools.dispatch(call["name"], call["arguments"], call_id=call["call_id"])
 
     def _await_tool_future(self, future: Any) -> Iterator[VolleyEvent | ToolResult]:
         while True:

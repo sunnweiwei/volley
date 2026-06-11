@@ -202,8 +202,19 @@ class ToolRuntime:
         if callable(interrupt_agents):
             interrupt_agents()
 
-    def dispatch(self, name: str, arguments: Any, *, call_id: str | None = None) -> ToolResult:
+    def clear_interrupt(self) -> None:
         self._interrupt_event.clear()
+
+    def dispatch(
+        self,
+        name: str,
+        arguments: Any,
+        *,
+        call_id: str | None = None,
+        clear_interrupt: bool = True,
+    ) -> ToolResult:
+        if clear_interrupt:
+            self._interrupt_event.clear()
         registry = {tool.name: tool for tool in self.definitions()}
         tool = registry.get(name)
         if tool is None:
